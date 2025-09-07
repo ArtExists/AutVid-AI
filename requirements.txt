@@ -1,0 +1,26 @@
+# Core
+flask>=3.0.0
+streamlit>=1.36.0
+
+# ML / CV / Audio
+torch>=2.1.0
+torchaudio>=2.1.0
+transformers>=4.42.0
+datasets>=2.20.0
+evaluate>=0.4.2
+numpy>=1.25.0
+opencv-python>=4.9.0.80
+ultralytics>=8.2.0
+supervision>=0.18.0
+
+# Whisper + recording
+openai-whisper>=20231117
+sounddevice>=0.4.6
+
+# Utilities
+tqdm>=4.66.0
+
+#miscel
+hf_xet
+scikit-learn
+gunicorn
