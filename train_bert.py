@@ -44,7 +44,7 @@ def compute_metrics(eval_pred):
 
 args = TrainingArguments(
     output_dir="bert_emotion",
-    evaluation_strategy="epoch",
+    eval_strategy="epoch",
     save_strategy="epoch",
     learning_rate=2e-5,
     per_device_train_batch_size=16,

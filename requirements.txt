@@ -12,6 +12,7 @@ numpy>=1.25.0
 opencv-python>=4.9.0.80
 ultralytics>=8.2.0
 supervision>=0.18.0
+streamlit-webrtc
 
 # Whisper + recording
 openai-whisper>=20231117

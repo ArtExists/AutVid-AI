@@ -1,206 +1,340 @@
+# model.py -- Continuous realtime video+audio with streamlit-webrtc
 import os
+import time
+import threading
+import wave
 from pathlib import Path
-import streamlit as st
-import numpy as np
-import torch
+from typing import List, Tuple, Dict
+
+import av
 import cv2
-from typing import Dict, List, Tuple
+import numpy as np
+import streamlit as st
+import torch
 
-# Video (YOLO) detector
-from face_model import FacialEmotionDetector
-# Voice analyzer (emotion + ASR)
-from voice_det import Voice_Analysis
-
-# Text model (BERT multi-label by default if your fine-tuned model exists)
 from transformers import BertTokenizer, BertForSequenceClassification
 
-st.set_page_config(page_title="AutVid AI - Multimodal Emotion Analysis", page_icon="🧠", layout="wide")
-st.markdown("<h1 style='text-align:center;'>🧠 AutVid AI - Multimodal Emotion Analysis</h1>", unsafe_allow_html=True)
+# Your modules (must exist)
+from face_model import FacialEmotionDetector
+from voice_det import Voice_Analysis
 
-# ------------------ CACHED LOADERS ------------------ #
+from streamlit_webrtc import webrtc_streamer, WebRtcMode, VideoTransformerBase, AudioProcessorBase
+
+# ------------------------- Config -------------------------
+FRAME_DETECT_EVERY_N = 4   # run YOLO every Nth frame (tune for performance)
+AUDIO_SAMPLE_RATE = 48000  # expected browser sample rate for webrtc audio
+TEMP_AUDIO_PATH = "temp_recordings/live.wav"
+BEST_PT = Path(__file__).parent / "best.pt"
+
+st.set_page_config(page_title="AutVid AI — Realtime", layout="wide")
+st.title("🧠 AutVid AI — Real-time Video + Audio Emotion")
+
+# ------------------------- Cached model loaders -------------------------
 @st.cache_resource
-def load_face_model():
-    # Adjust path to your YOLO weights
-    model_path = "best.pt"
-    return FacialEmotionDetector(model_path=model_path)
+def load_face_model_main():
+    if not BEST_PT.exists():
+        st.warning(f"YOLO weights not found at {BEST_PT.resolve()}. Video detection will show placeholder.")
+        return None
+    try:
+        det = FacialEmotionDetector(model_path=str(BEST_PT))
+        st.info("FacialEmotionDetector loaded.")
+        return det
+    except Exception as e:
+        st.error(f"Failed to load FacialEmotionDetector: {e}")
+        return None
 
 @st.cache_resource
 def load_voice_model():
-    return Voice_Analysis()
+    try:
+        vm = Voice_Analysis()
+        st.info("Voice_Analysis loaded.")
+        return vm
+    except Exception as e:
+        st.error(f"Failed to load Voice_Analysis: {e}")
+        return None
 
 @st.cache_resource
 def load_text_model():
-    """
-    Try to load local fine-tuned model at ./bert_emotion (from train_bert.py).
-    Fallback to a public BERT fine-tuned on GoEmotions.
-    """
-    if Path("./bert_emotion").exists():
-        model_name = "./bert_emotion"
-    else:
-        # BERT model fine-tuned on GoEmotions (multi-label)
+    try:
         model_name = "bhadresh-savani/bert-base-go-emotion"
+        tok = BertTokenizer.from_pretrained(model_name)
+        mdl = BertForSequenceClassification.from_pretrained(model_name)
+        mdl.eval()
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        mdl.to(device)
+        id2label = mdl.config.id2label if hasattr(mdl.config, "id2label") else {i: str(i) for i in range(mdl.config.num_labels)}
+        label_list = [id2label[i] for i in range(len(id2label))]
+        st.info("Text model loaded.")
+        return tok, mdl, device, label_list
+    except Exception as e:
+        st.error(f"Failed to load text model: {e}")
+        return None, None, None, []
 
-    tokenizer = BertTokenizer.from_pretrained(model_name)
-    model = BertForSequenceClassification.from_pretrained(model_name)
-    model.eval()
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model.to(device)
-
-    # label mapping (GoEmotions - 28 incl neutral in some configs; tokenizer/model has id2label)
-    id2label = model.config.id2label if hasattr(model.config, "id2label") else {i: str(i) for i in range(model.config.num_labels)}
-    label_list = [id2label[i] for i in range(len(id2label))]
-
-    return tokenizer, model, device, label_list
-
-face_model = load_face_model()
+face_model_main = load_face_model_main()
 voice_model = load_voice_model()
 tokenizer, text_model, device, label_list = load_text_model()
 
-# ------------------ HELPERS ------------------ #
+# ------------------------- Utilities -------------------------
 def analyze_text_multilabel(text: str, threshold: float = 0.3) -> Tuple[List[str], Dict[str, float]]:
-    """Return list of emotions above threshold + full prob dict."""
-    if not text.strip():
+    if not text.strip() or text_model is None:
         return [], {}
-
     enc = tokenizer(text, return_tensors="pt", truncation=True, padding=True, max_length=256).to(device)
     with torch.no_grad():
         logits = text_model(**enc).logits
-        probs = torch.sigmoid(logits)[0].detach().cpu().numpy()  # multi-label
-
+        probs = torch.sigmoid(logits)[0].cpu().numpy()
     scores = {label_list[i]: float(probs[i]) for i in range(len(label_list))}
     chosen = [lbl for lbl, p in scores.items() if p >= threshold]
-    # if nothing crossed threshold, take top-1
     if not chosen:
-        top = max(scores, key=scores.get)
-        chosen = [top]
+        chosen = [max(scores, key=scores.get)]
     return chosen, scores
 
-def fuse_emotions(video_emotion: str, voice_emotion: str, text_emotions: List[str]) -> Tuple[str, Dict[str, float]]:
-    """Weighted fusion: video 0.5, voice 0.3, text 0.2 (distributed among predicted text labels)."""
-    weights = {"video": 0.5, "voice": 0.3, "text": 0.2}
-    scores: Dict[str, float] = {}
+# ------------------------- WebRTC processors -------------------------
+class AudioRecorder(AudioProcessorBase):
+    """Collect audio frames from webrtc, provide save/clear functions for main thread analysis."""
+    def __init__(self):
+        self.frames = []
+        self.lock = threading.Lock()
+        self.sample_rate = AUDIO_SAMPLE_RATE
 
-    if video_emotion:
-        scores[video_emotion] = scores.get(video_emotion, 0.0) + weights["video"]
-
-    if voice_emotion:
-        scores[voice_emotion] = scores.get(voice_emotion, 0.0) + weights["voice"]
-
-    if text_emotions:
-        share = weights["text"] / len(text_emotions)
-        for t in text_emotions:
-            scores[t] = scores.get(t, 0.0) + share
-
-    dominant = max(scores, key=scores.get) if scores else "unknown"
-    return dominant, scores
-
-def cv2_to_st(frame_bgr):
-    return cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-
-# ------------------ SESSION STATE ------------------ #
-if "video_emotion" in st.session_state is False:
-    st.session_state["video_emotion"] = None
-if "voice_emotion" in st.session_state is False:
-    st.session_state["voice_emotion"] = None
-if "text_emotions" in st.session_state is False:
-    st.session_state["text_emotions"] = []
-if "transcript" in st.session_state is False:
-    st.session_state["transcript"] = ""
-
-# ------------------ UI TABS ------------------ #
-tab1, tab2, tab3, tab4 = st.tabs(["🎥 Video", "🎵 Voice", "📝 Text", "⚡ Combined"])
-
-# ---- VIDEO TAB ---- #
-with tab1:
-    st.subheader("Video Emotion Detection (YOLO)")
-    st.caption("Upload an image or use your camera to capture a frame.")
-
-    colA, colB = st.columns(2)
-    with colA:
-        img_file = st.file_uploader("Upload an image (jpg/png)", type=["jpg", "jpeg", "png"])
-        if img_file is not None:
-            file_bytes = np.asarray(bytearray(img_file.read()), dtype=np.uint8)
-            frame = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
-            annotated, emo = face_model.detect_emotion(frame)
-            st.image(cv2_to_st(annotated), caption=f"Detected: {emo}")
-            st.session_state["video_emotion"] = emo
-
-    with colB:
-        snap = st.camera_input("Or capture from your webcam")
-        if snap is not None:
-            snap_bytes = np.asarray(bytearray(snap.read()), dtype=np.uint8)
-            frame = cv2.imdecode(snap_bytes, cv2.IMREAD_COLOR)
-            annotated, emo = face_model.detect_emotion(frame)
-            st.image(cv2_to_st(annotated), caption=f"Detected: {emo}")
-            st.session_state["video_emotion"] = emo
-
-    if st.session_state["video_emotion"]:
-        st.success(f"Video Emotion: {st.session_state['video_emotion']}")
-
-# ---- VOICE TAB ---- #
-with tab2:
-    st.subheader("Voice Emotion & Transcription")
-    st.caption("Record 3 seconds or upload a .wav file.")
-
-    colL, colR = st.columns(2)
-
-    with colL:
-        if st.button("🎙️ Record 3s"):
-            wav_path = voice_model.record_audio("temp_recordings/record.wav", duration=3)
-            st.audio(wav_path)
-            results = voice_model.detect(wav_path)
-            if results:
-                voice_label = max(results, key=lambda r: r["score"])["label"]
-                st.session_state["voice_emotion"] = voice_label
-                # Also transcribe
-                st.session_state["transcript"] = voice_model.subtitles(wav_path)
-            st.success(f"Voice Emotion: {st.session_state.get('voice_emotion', 'N/A')}")
-            if st.session_state["transcript"]:
-                st.info(f"Transcript: {st.session_state['transcript']}")
-
-    with colR:
-        up = st.file_uploader("Upload WAV", type=["wav"])
-        if up is not None:
-            tmp_path = "temp_uploads/upload.wav"
-            os.makedirs(os.path.dirname(tmp_path), exist_ok=True)
-            with open(tmp_path, "wb") as f:
-                f.write(up.read())
-            st.audio(tmp_path)
-            results = voice_model.detect(tmp_path)
-            if results:
-                voice_label = max(results, key=lambda r: r["score"])["label"]
-                st.session_state["voice_emotion"] = voice_label
-                st.session_state["transcript"] = voice_model.subtitles(tmp_path)
-            st.success(f"Voice Emotion: {st.session_state.get('voice_emotion', 'N/A')}")
-            if st.session_state["transcript"]:
-                st.info(f"Transcript: {st.session_state['transcript']}")
-
-# ---- TEXT TAB ---- #
-with tab3:
-    st.subheader("Text Emotion (BERT multi-label)")
-    default_text = st.session_state.get("transcript", "")
-    text_in = st.text_area("Enter text to analyze", value=default_text, height=120, placeholder="Type or paste transcript...")
-    thresh = st.slider("Confidence threshold", min_value=0.1, max_value=0.9, value=0.3, step=0.05)
-    if st.button("🚀 Analyze Text"):
-        chosen, scores = analyze_text_multilabel(text_in, threshold=thresh)
-        st.session_state["text_emotions"] = chosen
-        if scores:
-            st.json({k: round(v, 4) for k, v in sorted(scores.items(), key=lambda x: x[1], reverse=True)})
-        if chosen:
-            st.success(f"Predicted (≥{thresh:.2f}): {', '.join(chosen)}")
-
-# ---- COMBINED TAB ---- #
-with tab4:
-    st.subheader("Multimodal Fusion")
-    st.write("Weights: Video **0.5**, Voice **0.3**, Text **0.2**")
-    ve = st.session_state.get("video_emotion")
-    vo = st.session_state.get("voice_emotion")
-    te = st.session_state.get("text_emotions", [])
-    if st.button("⚡ Fuse Now"):
-        dominant, scores = fuse_emotions(ve, vo, te)
-        if scores:
-            st.success(f"🎭 Dominant Emotion: **{dominant}**")
-            st.write("Breakdown (higher = stronger influence):")
-            st.json({k: round(v, 3) for k, v in sorted(scores.items(), key=lambda x: x[1], reverse=True)})
+    def recv_audio(self, frame: av.AudioFrame) -> av.AudioFrame:
+        arr = frame.to_ndarray()
+        # arr shape for audio frames: (channels, samples)
+        if arr.ndim == 2:
+            mono = np.mean(arr, axis=0).astype(np.int16)
         else:
-            st.warning("Please run at least one modality first (Video / Voice / Text).")
+            mono = arr.astype(np.int16)
+        with self.lock:
+            self.frames.append(mono)
+        return frame
+
+    def save_wav(self, filename: str = TEMP_AUDIO_PATH) -> str:
+        os.makedirs(os.path.dirname(filename), exist_ok=True)
+        with self.lock:
+            if not self.frames:
+                raise ValueError("No audio captured")
+            audio = np.concatenate(self.frames, axis=0).astype(np.int16)
+        # write wav
+        with wave.open(filename, "wb") as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2)
+            wf.setframerate(self.sample_rate)
+            wf.writeframes(audio.tobytes())
+        return filename
+
+    def clear(self):
+        with self.lock:
+            self.frames = []
+
+class VideoProcessor(VideoTransformerBase):
+    """Process each incoming frame (called in worker). Returns annotated frame every time (no freeze)."""
+    def __init__(self):
+        # Try to create a worker-side detector; if fails we fallback to placeholder text.
+        try:
+            if BEST_PT.exists():
+                self.detector = FacialEmotionDetector(model_path=str(BEST_PT))
+            else:
+                self.detector = None
+        except Exception as e:
+            print("Worker detector init failed:", e)
+            self.detector = None
+
+        self.last_annotated = None
+        self.last_emotion = None
+        self.lock = threading.Lock()
+        self.counter = 0
+
+    def transform(self, frame: av.VideoFrame) -> av.VideoFrame:
+        img = frame.to_ndarray(format="bgr24")
+        annotated = img.copy()
+        emo = None
+
+        # run detection only every N frames to maintain speed
+        self.counter += 1
+        try:
+            if self.counter % FRAME_DETECT_EVERY_N == 0 and self.detector is not None:
+                ann, emo = self.detector.detect_emotion(img)  # expected (bgr_annotated, label)
+                if ann is not None:
+                    annotated = ann
+        except Exception as e:
+            # do not break stream on detection error
+            print("Frame detection error:", e)
+
+        # If no detector, optionally draw placeholder
+        if self.detector is None:
+            cv2.putText(annotated, "Detector not loaded (worker)", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,0,255), 2)
+
+        with self.lock:
+            self.last_annotated = annotated.copy()
+            self.last_emotion = emo
+
+        return av.VideoFrame.from_ndarray(annotated, format="bgr24")
+
+    def get_last(self):
+        with self.lock:
+            return self.last_annotated, self.last_emotion
+
+# ------------------------- Session state defaults -------------------------
+for k, v in {
+    "video_emotion": None,
+    "voice_emotion": None,
+    "transcript": "",
+    "text_emotions": []
+}.items():
+    if k not in st.session_state:
+        st.session_state[k] = v
+
+# ------------------------- UI / Streamer -------------------------
+st.sidebar.markdown("## Controls")
+st.sidebar.write("Frame detection every N frames (lower => more CPU).")
+FRAME_DETECT_EVERY_N = st.sidebar.slider("Run YOLO every N frames", 1, 12, FRAME_DETECT_EVERY_N, 1)
+auto_analyze = st.sidebar.checkbox("Auto analyze audio every interval", value=False)
+auto_interval = st.sidebar.slider("Auto analyze interval (s)", 5, 30, 12, 1)
+
+col_main, col_side = st.columns([2, 1])
+
+with col_main:
+    st.subheader("Live camera (annotated)")
+    st.caption("Grant camera & microphone access in your browser. This stream will continuously run.")
+    ctx = webrtc_streamer(
+        key="live-av",
+        mode=WebRtcMode.SENDRECV,
+        video_transformer_factory=VideoProcessor,
+        audio_processor_factory=AudioRecorder,
+        media_stream_constraints={"video": True, "audio": True},
+        async_processing=True,
+    )
+
+    st.markdown("---")
+    st.write("Live preview below (annotated frames from worker):")
+    # Display last annotated frame from worker (not the small webrtc preview)
+    if ctx and ctx.video_transformer:
+        try:
+            annotated_frame, last_emo = ctx.video_transformer.get_last()
+            if annotated_frame is not None:
+                st.image(cv2.cvtColor(annotated_frame, cv2.COLOR_BGR2RGB), caption=f"Worker emotion: {last_emo}")
+        except Exception:
+            pass
+
+with col_side:
+    st.subheader("Live outputs")
+    st.metric("Video emotion (live)", st.session_state.get("video_emotion") or "N/A")
+    st.metric("Voice emotion (last)", st.session_state.get("voice_emotion") or "N/A")
+    st.markdown("**Transcript (last)**")
+    st.text_area("Transcript", value=st.session_state.get("transcript", ""), height=160)
+
+    st.markdown("---")
+    if st.button("Clear audio buffer"):
+        if ctx and ctx.audio_receiver:
+            try:
+                ctx.audio_receiver._processor.clear()
+                st.success("Cleared audio buffer.")
+            except Exception as e:
+                st.error(f"Clear failed: {e}")
+
+    if st.button("Save & Analyze now"):
+        if ctx and ctx.audio_receiver:
+            proc = ctx.audio_receiver._processor
+            try:
+                wav = proc.save_wav(TEMP_AUDIO_PATH)
+                st.audio(wav)
+                # main-thread analysis
+                if voice_model is not None:
+                    try:
+                        res = voice_model.detect(wav)
+                        if res:
+                            st.session_state.voice_emotion = max(res, key=lambda r: r["score"])["label"]
+                        else:
+                            st.session_state.voice_emotion = None
+                    except Exception as e:
+                        st.error(f"voice_model.detect failed: {e}")
+
+                    try:
+                        txt = voice_model.subtitles(wav)
+                        st.session_state.transcript = txt
+                    except Exception as e:
+                        st.error(f"voice_model.subtitles failed: {e}")
+                st.success("Saved and analyzed audio.")
+            except Exception as e:
+                st.error(f"Save/analyze failed: {e}")
+        else:
+            st.error("Stream not active or audio processor unavailable.")
+
+# Update live video emotion from worker (main thread reading)
+if ctx and ctx.video_transformer:
+    try:
+        _, last_vid_emo = ctx.video_transformer.get_last()
+        if last_vid_emo:
+            st.session_state.video_emotion = last_vid_emo
+    except Exception:
+        pass
+
+# Auto analyze logic (main thread; triggered periodically by reruns)
+if auto_analyze and ctx and ctx.audio_receiver:
+    last_key = "_last_auto_ts"
+    now = time.time()
+    if last_key not in st.session_state:
+        st.session_state[last_key] = 0.0
+    if now - st.session_state[last_key] > auto_interval:
+        try:
+            proc = ctx.audio_receiver._processor
+            wav = proc.save_wav(TEMP_AUDIO_PATH.replace(".wav", "_auto.wav"))
+            st.audio(wav)
+            if voice_model is not None:
+                try:
+                    res = voice_model.detect(wav)
+                    if res:
+                        st.session_state.voice_emotion = max(res, key=lambda r: r["score"])["label"]
+                except Exception as e:
+                    st.error(f"Auto voice detect failed: {e}")
+                try:
+                    txt = voice_model.subtitles(wav)
+                    st.session_state.transcript = txt
+                except Exception as e:
+                    st.error(f"Auto transcription failed: {e}")
+            # clear buffer to avoid repetition
+            proc.clear()
+            st.session_state[last_key] = now
+            st.success("Auto-analyze done.")
+        except Exception as e:
+            # ignore if not ready
+            pass
+
+# ---- Text analysis UI ----
+st.markdown("---")
+st.subheader("Text Emotion (BERT multi-label)")
+text_in = st.text_area("Enter text to analyze", value=st.session_state.get("transcript", ""), height=140)
+thresh = st.slider("Confidence threshold", 0.1, 0.9, 0.3, 0.05)
+if st.button("Analyze text"):
+    chosen, scores = analyze_text_multilabel(text_in, threshold=thresh)
+    st.session_state.text_emotions = chosen
+    if scores:
+        st.json({k: round(v, 4) for k, v in sorted(scores.items(), key=lambda x: x[1], reverse=True)})
+    if chosen:
+        st.success(f"Predicted (≥{thresh:.2f}): {', '.join(chosen)}")
+
+# ---- Fusion UI ----
+st.markdown("---")
+st.subheader("Multimodal Fusion")
+st.write("Video 0.5, Voice 0.3, Text 0.2")
+
+def fuse(video_emotion, voice_emotion, text_emotions):
+    w = {"video": 0.5, "voice": 0.3, "text": 0.2}
+    s = {}
+    if video_emotion:
+        s[video_emotion] = s.get(video_emotion, 0.0) + w["video"]
+    if voice_emotion:
+        s[voice_emotion] = s.get(voice_emotion, 0.0) + w["voice"]
+    if text_emotions:
+        share = w["text"] / max(1, len(text_emotions))
+        for t in text_emotions:
+            s[t] = s.get(t, 0.0) + share
+    return s
+
+if st.button("Fuse now"):
+    breakdown = fuse(st.session_state.get("video_emotion"), st.session_state.get("voice_emotion"), st.session_state.get("text_emotions", []))
+    if breakdown:
+        dom = max(breakdown, key=breakdown.get)
+        st.success(f"Dominant emotion: {dom}")
+        st.json({k: round(v, 3) for k, v in breakdown.items()})
+    else:
+        st.warning("No modalities available yet.")
